@@ -311,7 +311,7 @@ def evaluate(args: Args):
 
             success_flag = "unknown"
 
-            for episode_id in range(num_episodes):
+            for episode_id in range(10):
                 if str(episode_id) in log_dict[task_name]:
                     print(f"[robomme] episode {episode_id} already evaluated, skipping...")
                     continue

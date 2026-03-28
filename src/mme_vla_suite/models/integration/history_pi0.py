@@ -29,6 +29,19 @@ from mme_vla_suite.models.config.utils import get_history_config
 logger = logging.getLogger("history-pi0")
 
 
+def _get_prefix_attention_region_lengths(
+    total_prefix_tokens: int,
+    *,
+    memory_tokens: int = 512,
+    image_tokens: int = 512,
+) -> tuple[int, int, int]:
+    memory_len = min(memory_tokens, total_prefix_tokens)
+    remaining = max(total_prefix_tokens - memory_len, 0)
+    image_len = min(image_tokens, remaining)
+    language_len = max(remaining - image_len, 0)
+    return memory_len, image_len, language_len
+
+
 def make_attn_mask(input_mask, mask_ar, mask_na=None):
     """Adapted from pi0.py
 
@@ -638,6 +651,147 @@ class HistoryPi0(BaseModel):
         return jnp.mean(jnp.square(v_t - u_t), axis=-1), stats
 
     @override
+    def _prepare_sampling_prefix(self, observation: HistAugObservation):
+        attention_stats_spec = None
+        mem_seq = None
+        mem_mask = None
+
+        if self.integration_type == "expert":
+            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _ = self.embed_memory(observation)
+            vlm_tokens, vlm_mask, vlm_ar_mask, vlm_na_mask, _ = self.embed_prefix(observation)
+            mem_ar_mask = jnp.array(mem_ar_mask)
+            mem_na_mask = jnp.array(mem_na_mask)
+            prefix_mask = jnp.concatenate([mem_input_mask, vlm_mask], axis=1)
+            prefix_ar_mask = jnp.concatenate([mem_ar_mask, vlm_ar_mask], axis=0)
+            prefix_na_mask = jnp.concatenate([mem_na_mask, vlm_na_mask], axis=0)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, prefix_na_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, kv_cache = self.PaliGemma.llm(
+                [mem_tokens, vlm_tokens, None],
+                mask=prefix_attn_mask,
+                positions=positions,
+            )
+            memory_len, image_len, language_len = _get_prefix_attention_region_lengths(
+                mem_input_mask.shape[1] + vlm_mask.shape[1]
+            )
+            attention_stats_spec = {
+                "key_region_lengths": (memory_len, image_len, language_len),
+                "query_last_n": self.action_horizon,
+            }
+        elif self.integration_type == "modulation":
+            prefix_tokens, prefix_mask, prefix_ar_mask, _, _ = self.embed_prefix(observation)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, kv_cache = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+            )
+            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+        else:
+            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
+            if self.integration_type == "context":
+                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, prefix_na_mask)
+                memory_len, image_len, language_len = _get_prefix_attention_region_lengths(
+                    prefix_mask.shape[1]
+                )
+                attention_stats_spec = {
+                    "key_region_lengths": (memory_len, image_len, language_len),
+                    "query_last_n": self.action_horizon,
+                }
+            else:
+                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, kv_cache = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+            )
+
+        return prefix_mask, kv_cache, attention_stats_spec, mem_seq, mem_mask
+
+    def _sampling_step(
+        self,
+        observation: HistAugObservation,
+        x_t: at.Float[at.Array, "b ah ad"],
+        time: at.Float[at.Array, ""],
+        dt: float,
+        batch_size: int,
+        prefix_mask: at.Bool[at.Array, "b p"],
+        kv_cache,
+        attention_stats_spec: dict[str, Any] | None,
+        mem_seq,
+        mem_mask,
+        *,
+        collect_stats: bool = False,
+    ):
+        suffix_tokens, suffix_mask, suffix_ar_mask, _, adarms_cond = (
+            self.embed_suffix(observation, x_t, jnp.broadcast_to(time, batch_size))
+        )
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn_mask = einops.repeat(
+            prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+        )
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        assert full_attn_mask.shape == (
+            batch_size,
+            suffix_tokens.shape[1],
+            prefix_mask.shape[1] + suffix_tokens.shape[1],
+        )
+        positions = (
+            jnp.sum(prefix_mask, axis=-1)[:, None]
+            + jnp.cumsum(suffix_mask, axis=-1)
+            - 1
+        )
+
+        layer_stats = None
+        if self.integration_type == "expert":
+            llm_out = self.PaliGemma.llm(
+                [None, None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, None, adarms_cond],
+                attention_stats_spec=attention_stats_spec,
+                return_stats=collect_stats,
+            )
+            if collect_stats:
+                (mem_out, prefix_out, suffix_out), _, layer_stats = llm_out
+            else:
+                (mem_out, prefix_out, suffix_out), _ = llm_out
+            assert mem_out is None
+        elif self.integration_type == "modulation":
+            llm_out = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                mem_seq=[None, mem_seq],
+                mem_mask=[None, mem_mask],
+                capture_modulation_stats=collect_stats,
+                return_stats=collect_stats,
+            )
+            if collect_stats:
+                (prefix_out, suffix_out), _, layer_stats = llm_out
+            else:
+                (prefix_out, suffix_out), _ = llm_out
+        else:
+            llm_out = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                attention_stats_spec=attention_stats_spec,
+                return_stats=collect_stats,
+            )
+            if collect_stats:
+                (prefix_out, suffix_out), _, layer_stats = llm_out
+            else:
+                (prefix_out, suffix_out), _ = llm_out
+
+        assert prefix_out is None
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        return x_t + dt * v_t, time + dt, layer_stats
+
+    @override
     def sample_actions(
         self,
         rng: at.KeyArrayLike,
@@ -657,107 +811,26 @@ class HistoryPi0(BaseModel):
                 rng, (batch_size, self.action_horizon, self.action_dim)
             )
 
-        if self.integration_type == "expert":
-            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _ = self.embed_memory(observation)
-            vlm_tokens, vlm_mask, vlm_ar_mask, vlm_na_mask, _ = self.embed_prefix(observation)
-            mem_ar_mask = jnp.array(mem_ar_mask)
-            mem_na_mask = jnp.array(mem_na_mask)
-            prefix_mask = jnp.concatenate([mem_input_mask, vlm_mask], axis=1)
-            prefix_ar_mask = jnp.concatenate([mem_ar_mask, vlm_ar_mask], axis=0)
-            prefix_na_mask = jnp.concatenate([mem_na_mask, vlm_na_mask], axis=0)
-            prefix_attn_mask = make_attn_mask(
-                prefix_mask, prefix_ar_mask, prefix_na_mask
-            )
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            _, kv_cache = self.PaliGemma.llm(
-                [mem_tokens, vlm_tokens, None],
-                mask=prefix_attn_mask,
-                positions=positions,
-            )
-
-        elif self.integration_type == "modulation":
-            prefix_tokens, prefix_mask, prefix_ar_mask, _, _ = self.embed_prefix(observation)
-            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            _, kv_cache = self.PaliGemma.llm(
-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-            )
-            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
-            
-        else:
-            prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
-            if self.integration_type == "context":
-                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask, prefix_na_mask)
-            else:
-                prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            _, kv_cache = self.PaliGemma.llm(
-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-            )
-            
+        prefix_mask, kv_cache, attention_stats_spec, mem_seq, mem_mask = (
+            self._prepare_sampling_prefix(observation)
+        )
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, _, adarms_cond = (
-                self.embed_suffix(observation, x_t, jnp.broadcast_to(time, batch_size))
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(
-                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
-            )
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate(
-                [prefix_attn_mask, suffix_attn_mask], axis=-1
-            )
-            assert full_attn_mask.shape == (
+            x_t, time, _ = self._sampling_step(
+                observation,
+                x_t,
+                time,
+                dt,
                 batch_size,
-                suffix_tokens.shape[1],
-                prefix_mask.shape[1] + suffix_tokens.shape[1],
+                prefix_mask,
+                kv_cache,
+                attention_stats_spec,
+                mem_seq,
+                mem_mask,
+                collect_stats=False,
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = (
-                jnp.sum(prefix_mask, axis=-1)[:, None]
-                + jnp.cumsum(suffix_mask, axis=-1)
-                - 1
-            )
-
-            if self.integration_type == "expert":
-                (mem_out, prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, None, adarms_cond],
-                )
-                assert mem_out is None
-            elif self.integration_type == "modulation":
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, adarms_cond],
-                    mem_seq=[None, mem_seq],
-                    mem_mask=[None, mem_mask],
-                )
-            else:
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, adarms_cond],
-                )
-
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-            return x_t + dt * v_t, time + dt
+            return x_t, time
 
         def cond(carry):
             x_t, time = carry
@@ -766,6 +839,67 @@ class HistoryPi0(BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_with_stats(
+        self,
+        rng: at.KeyArrayLike,
+        observation: HistAugObservation,
+        *,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[Actions, dict[str, at.Array]]:
+        observation = preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(
+                rng, (batch_size, self.action_horizon, self.action_dim)
+            )
+
+        prefix_mask, kv_cache, attention_stats_spec, mem_seq, mem_mask = (
+            self._prepare_sampling_prefix(observation)
+        )
+        x_t = noise
+        time = 1.0
+        step_stats = []
+        for _ in range(num_steps):
+            x_t, time, layer_stats = self._sampling_step(
+                observation,
+                x_t,
+                time,
+                dt,
+                batch_size,
+                prefix_mask,
+                kv_cache,
+                attention_stats_spec,
+                mem_seq,
+                mem_mask,
+                collect_stats=True,
+            )
+            step_stats.append(layer_stats)
+
+        if self.integration_type in {"expert", "context"}:
+            stats = {
+                "attention_region_means": jnp.stack(
+                    [step["attention_region_means"] for step in step_stats], axis=0
+                ),
+                "key_region_lengths": jnp.asarray(
+                    attention_stats_spec["key_region_lengths"], dtype=jnp.int32
+                ),
+            }
+        elif self.integration_type == "modulation":
+            stats = {
+                "modulation_scale": jnp.stack(
+                    [step["modulation_scale"] for step in step_stats], axis=0
+                ),
+                "modulation_shift": jnp.stack(
+                    [step["modulation_shift"] for step in step_stats], axis=0
+                ),
+            }
+        else:
+            stats = {}
+
+        return x_t, stats
     
     
     def vision_encode(self, images: at.Float[at.Array, "k v 224 224 3"]):

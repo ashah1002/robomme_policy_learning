@@ -22,6 +22,7 @@ SEED=7          # model seed for evaluation; change this to use different seeds 
 CKPT_ID=79999   # ckpt id for evaluation; change this to use different checkpoints
 GPU_ID_server=0 # gpu id for server; when set, the VLA policy server will run on this GPU
 GPU_ID_client=1 # gpu id for client; when set, the RoboMME environment and/or VLM subgoal predictor will run on this GPU
+DUMP_STATS=true
 #--------------------------------#
 
 
@@ -85,6 +86,7 @@ fi
 
 
 session_name="${MODEL_TYPE}_ckpt${CKPT_ID}_seed${SEED}_port${PORT}"
+STATS_DIR="runs/eval_stats/${MODEL_TYPE}/ckpt${CKPT_ID}_seed${SEED}"
 echo "Evaluating $MODEL_TYPE with seed $SEED and ckpt id $CKPT_ID on port $PORT"
 
 
@@ -92,9 +94,13 @@ echo "Evaluating $MODEL_TYPE with seed $SEED and ckpt id $CKPT_ID on port $PORT"
 tmux has-session -t $session_name 2>/dev/null
 
 if [ $? != 0 ]; then
+    STATS_ARGS=""
+    if [ "$DUMP_STATS" = true ]; then
+        STATS_ARGS="--stats-dir=${STATS_DIR}"
+    fi
     # Create new tmux session with first window for serve_policy
     tmux new-session -d -s $session_name -n "serve_policy" 
-    tmux send-keys -t $session_name:serve_policy "CUDA_VISIBLE_DEVICES=$GPU_ID_server uv run scripts/serve_policy.py --seed=$SEED  --port=$PORT policy:checkpoint --policy.dir=runs/ckpts/$CONFIG_TYPE/$MODEL_TYPE/$CKPT_ID --policy.config=$CONFIG_TYPE" Enter
+    tmux send-keys -t $session_name:serve_policy "CUDA_VISIBLE_DEVICES=$GPU_ID_server uv run scripts/serve_policy.py --seed=$SEED --port=$PORT ${STATS_ARGS} policy:checkpoint --policy.dir=runs/ckpts/$CONFIG_TYPE/$MODEL_TYPE/$CKPT_ID --policy.config=$CONFIG_TYPE" Enter
 
     sleep 30
     

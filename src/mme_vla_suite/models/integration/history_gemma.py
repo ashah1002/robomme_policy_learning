@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from collections.abc import Sequence
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from openpi.models.gemma import PALIGEMMA_VOCAB_SIZE
 from openpi.models.gemma import Config
@@ -24,23 +24,49 @@ from mme_vla_suite.models.integration.utils import _name
 from mme_vla_suite.models.integration.utils import Attention_with_MemoryExpert
 from mme_vla_suite.models.integration.utils import get_config, Variant
 
+
+def _empty_stats() -> at.Float[at.Array, " n"]:
+    return jnp.zeros((0,), dtype=jnp.float32)
+
+
+def _summarize_attention_probs(
+    probs: at.Float[at.Array, "b k g t s"], key_region_lengths: Sequence[int] | None
+) -> at.Float[at.Array, " n"]:
+    if key_region_lengths is None:
+        return _empty_stats()
+
+    region_means = []
+    start = 0
+    for length in key_region_lengths:
+        end = start + length
+        region_means.append(jnp.mean(jnp.sum(probs[..., start:end], axis=-1), dtype=jnp.float32))
+        start = end
+    return jnp.stack(region_means, axis=0)
+
+
 @at.typecheck
 class MemoryRMSNorm(nn.Module):
     @nn.compact
-    def __call__(self, x, cond=None):
+    def __call__(self, x, cond=None, *, capture_stats: bool = False):
         dtype = x.dtype  # original dtype, could be half-precision
         var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
         normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))
         if cond is None:
             scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
             normed_inputs = normed_inputs * (1 + scale)
-            return normed_inputs.astype(dtype)
+            return normed_inputs.astype(dtype), None
         
         # modulation = nn.Dense(x.shape[-1] * 2, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
         modulation = nn.Dense(x.shape[-1] * 2, kernel_init=kernel_init_out_proj, dtype=dtype)(cond) # add small randomness instead of pure zeros
         scale, shift = jnp.split(modulation, 2, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift
-        return normed_inputs.astype(dtype)
+        stats = None
+        if capture_stats:
+            stats = {
+                "scale": scale.astype(jnp.float32),
+                "shift": shift.astype(jnp.float32),
+            }
+        return normed_inputs.astype(dtype), stats
 
 class MemoryAttention(nn.Module):
     """
@@ -75,10 +101,10 @@ class MemoryAttention(nn.Module):
             ),
         )
         rms_norm = MemoryRMSNorm(name="mem_rms_norm")
-        x = rms_norm(x)
+        x, _ = rms_norm(x)
         q = q_einsum("BTD,NDH->BTNH", x)
         
-        mem_seq = rms_norm(mem_seq)
+        mem_seq, _ = rms_norm(mem_seq)
         k, v = kv_einsum("BSD,2KDH->2BSKH", mem_seq)
         
         q_positions = einops.repeat(
@@ -129,6 +155,8 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
+        attention_stats_spec=None,
+        capture_modulation_stats: bool = False,
         deterministic=True,
     ):  # noqa: FBT002
 
@@ -159,7 +187,13 @@ class HistoryBlock(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, attn_stats = attn(
+            pre_attn,
+            positions,
+            attn_mask,
+            kv_cache,
+            attention_stats_spec=attention_stats_spec,
+        )
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [
@@ -171,12 +205,15 @@ class HistoryBlock(nn.Module):
 
         out = []
         gates = []
+        modulation_stats = None
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 # Add Memory Modulation before FFN
                 if i == len(xs) - 1 and self.integration_type == "modulation":
                     mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
-                    x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
+                    x, modulation_stats = MemoryRMSNorm(name="mem_rms_norm_ffn")(
+                        x, mem_mod_vec, capture_stats=capture_modulation_stats
+                    )
                 
                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
                 x, gate = RMSNorm(name=name)(
@@ -202,7 +239,16 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
         
-        return xs, kv_cache
+        layer_stats = {
+            "attention_region_means": attn_stats,
+            "modulation_scale": (
+                modulation_stats["scale"] if modulation_stats is not None else _empty_stats()
+            ),
+            "modulation_shift": (
+                modulation_stats["shift"] if modulation_stats is not None else _empty_stats()
+            ),
+        }
+        return xs, (kv_cache, layer_stats)
 
 
 KVCache: TypeAlias = tuple[
@@ -235,7 +281,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             HistoryBlock,
             prevent_cse=False,
-            static_argnums=(7,),  # 0=xs, 5=decode
+            static_argnums=(7, 8, 9),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -250,7 +296,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
+                nn.broadcast,
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=attention_stats_spec, 7=capture_modulation_stats, 8=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -278,14 +326,19 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+        attention_stats_spec: dict[str, Any] | None = None,
+        capture_modulation_stats: bool = False,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_stats: bool = False,
+    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache] | tuple[
+        Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, dict[str, at.Array]
+    ]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(
+        embedded, (kv_cache, layer_stats) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -293,6 +346,8 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
+            attention_stats_spec,
+            capture_modulation_stats,
             deterministic,
         )
 
@@ -300,10 +355,13 @@ class Module(nn.Module):
             e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None
         )
 
-        return [
+        embedded = [
             f(e, a)[0] if e is not None else e
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_stats:
+            return embedded, kv_cache, layer_stats
+        return embedded, kv_cache
 
     def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

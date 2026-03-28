@@ -24,6 +24,7 @@ def create_trained_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
+    stats_dir: pathlib.Path | str | None = None,
 ) -> _policy.MME_VLA_Policy:
     
     repack_transforms = repack_transforms or transforms.Group()
@@ -74,5 +75,6 @@ def create_trained_policy(
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
         norm_stats=norm_stats,
-        use_quantiles=data_config.use_quantile_norm
+        use_quantiles=data_config.use_quantile_norm,
+        stats_dir=stats_dir,
     )

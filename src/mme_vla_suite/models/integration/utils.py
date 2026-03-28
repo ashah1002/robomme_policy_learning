@@ -13,6 +13,33 @@ import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 
 
+def _empty_stats() -> at.Float[at.Array, " n"]:
+    return jnp.zeros((0,), dtype=jnp.float32)
+
+
+def _summarize_attention_probs(
+    probs: at.Float[at.Array, "b k g t s"],
+    key_region_lengths: Sequence[int] | None,
+    query_last_n: int | None = None,
+) -> at.Float[at.Array, " n"]:
+    if key_region_lengths is None:
+        return _empty_stats()
+
+    if query_last_n is not None:
+        probs = probs[..., -query_last_n:, :]
+
+    region_probs = []
+    start = 0
+    for length in key_region_lengths:
+        end = start + length
+        region_probs.append(jnp.sum(probs[..., start:end], axis=-1, dtype=jnp.float32))
+        start = end
+    region_probs = jnp.stack(region_probs, axis=0)
+    denom = jnp.clip(jnp.sum(region_probs, axis=0, keepdims=True), min=1e-8)
+    normalized = region_probs / denom
+    return jnp.mean(normalized, axis=(1, 2, 3, 4), dtype=jnp.float32)
+
+
 
 Variant = Literal[
     "dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora", "gemma_150m"
@@ -107,7 +134,7 @@ class Attention_with_MemoryExpert(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, attention_stats_spec=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -172,6 +199,11 @@ class Attention_with_MemoryExpert(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        attention_region_means = _summarize_attention_probs(
+            probs,
+            None if attention_stats_spec is None else attention_stats_spec["key_region_lengths"],
+            None if attention_stats_spec is None else attention_stats_spec.get("query_last_n"),
+        )
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -192,4 +224,4 @@ class Attention_with_MemoryExpert(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), attention_region_means

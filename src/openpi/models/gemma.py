@@ -109,6 +109,33 @@ def get_config(variant: Variant) -> Config:
     raise ValueError(f"Unknown variant: {variant}")
 
 
+def _empty_attention_stats() -> at.Float[at.Array, " n"]:
+    return jnp.zeros((0,), dtype=jnp.float32)
+
+
+def _summarize_attention_probs(
+    probs: at.Float[at.Array, "b k g t s"],
+    key_region_lengths: Sequence[int] | None,
+    query_last_n: int | None = None,
+) -> at.Float[at.Array, " n"]:
+    if key_region_lengths is None:
+        return _empty_attention_stats()
+
+    if query_last_n is not None:
+        probs = probs[..., -query_last_n:, :]
+
+    region_probs = []
+    start = 0
+    for length in key_region_lengths:
+        end = start + length
+        region_probs.append(jnp.sum(probs[..., start:end], axis=-1, dtype=jnp.float32))
+        start = end
+    region_probs = jnp.stack(region_probs, axis=0)
+    denom = jnp.clip(jnp.sum(region_probs, axis=0, keepdims=True), min=1e-8)
+    normalized = region_probs / denom
+    return jnp.mean(normalized, axis=(1, 2, 3, 4), dtype=jnp.float32)
+
+
 @at.typecheck
 class RMSNorm(nn.Module):
     @nn.compact
@@ -161,7 +188,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, attention_stats_spec=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -224,8 +251,14 @@ class Attention(nn.Module):
         # big_neg = jnp.finfo(logits.dtype).min
         big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
-
+        
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        
+        attention_region_means = _summarize_attention_probs(
+            probs,
+            None if attention_stats_spec is None else attention_stats_spec["key_region_lengths"],
+            None if attention_stats_spec is None else attention_stats_spec.get("query_last_n"),
+        )
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -246,7 +279,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), attention_region_means
 
 
 @at.typecheck
@@ -305,7 +338,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, _ = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]

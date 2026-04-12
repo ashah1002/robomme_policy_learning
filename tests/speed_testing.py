@@ -86,9 +86,9 @@ def main(
     config_name: str = "mme_vla_suite",
     repo_id: str = "robomme",
     dataset_path: str = "data/robomme_preprocessed_data",
-    dataset_type: str = "mmap",
-    history_config_path: str = "src/mme_vla_suite/models/config/robomme/recurrent-rmt-expert.yaml",
-    num_workers: int = 4,
+    dataset_type: str = "npy",
+    history_config_path: str = "src/mme_vla_suite/models/config/robomme/perceptual-framesamp-modul_hard.yaml",
+    num_workers: int = 0,
     batch_size: int = 64
 ):
     """Benchmark dataloader speed for npy / bin / mmap backends.
@@ -118,6 +118,7 @@ def main(
     max_batches = 100
     num_batches = min(num_batches, warmup_batches + max_batches)
     print(f"\n=== Benchmarking dataset_type={dataset_type}, num_workers={num_workers}, batch_size={batch_size} ===")
+    print(history_config_path)
     print(f"Warming up {warmup_batches} batches, then timing {max_batches} batches...")
 
     times = []
@@ -144,3 +145,40 @@ def main(
 
 if __name__ == "__main__":
     tyro.cli(main)
+
+
+# Turbo
+# Recurrent
+# --- Results (mmap) ---
+# Total time:      445.9s for 99 batches
+# Avg batch time:  4.504s
+# Median (p50):    1.700s
+# p95:             13.675s
+# Throughput:      14.2 samples/s
+
+# --- Results (npy) ---
+# Total time:      447.1s for 99 batches
+# Avg batch time:  4.516s
+# Median (p50):    4.510s
+# p95:             8.227s
+# Throughput:      14.2 samples/s
+
+# Bin has mistake. I dont know why
+
+# FrameSamp
+# --- Results (npy) ---
+# Total time:      272.8s for 99 batches
+# Avg batch time:  2.756s
+# Median (p50):    0.492s
+# p95:             11.865s
+# Throughput:      23.2 samples/s
+# --- Results (bin) ---
+# Total time:      104.3s for 99 batches
+# Avg batch time:  1.053s
+# Median (p50):    0.524s
+# p95:             3.216s
+# Throughput:      60.8 samples/s
+
+
+# FrameSamp Hard (4096, 64)
+# Still npy is the best...

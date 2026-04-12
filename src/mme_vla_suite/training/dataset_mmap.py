@@ -109,14 +109,14 @@ class RoboMMEDatasetMmap(RoboMMEDataset):
 
         history_feats = {}
         for frame_idx in indices_to_load:
-            # Return zero-copy views into the mmap.  Downstream code in
-            # MemoryBuffer.prepare_* always goes through np.stack/np.concatenate,
-            # which allocate new arrays, so views are safe here.  They also pickle
-            # correctly across DataLoader workers (tested).
+            # .copy() detaches from the mmap so the OS can reclaim pages after use.
+            # Without it, mmap views keep pages pinned in physical RAM, and with
+            # num_workers > 0 the aggregate resident set can OOM the machine
+            # (especially for recurrent configs: 64 frames × 64 tokens × 2048 dim).
             history_feats[frame_idx] = {
-                img_key: img_mm[frame_idx],
-                pos_key: pos_mm[frame_idx],
-                "state_emb": state_mm[frame_idx],
+                img_key: img_mm[frame_idx].copy(),
+                pos_key: pos_mm[frame_idx].copy(),
+                "state_emb": state_mm[frame_idx].copy(),
             }
 
         return history_feats

@@ -368,6 +368,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         num_workers=config.num_workers,
         seed=config.seed,
         dataset_type=config.dataset_type,
+        num_read_threads=config.num_read_threads,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)

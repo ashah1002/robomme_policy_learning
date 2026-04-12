@@ -44,6 +44,7 @@ def create_data_loader(
     compute_norm_stats: bool = False,
     seed: int = 0,
     dataset_type: str = "npy",
+    num_read_threads: int = 1,
 ):
     dataset_cls = {
         "npy": RoboMMEDataset,
@@ -51,12 +52,17 @@ def create_data_loader(
         "mmap": RoboMMEDatasetMmap,
     }[dataset_type]
 
-    dataset = dataset_cls(
+    dataset_kwargs = dict(
         dataset_path=dataset_path,
         data_config=data_config,
         history_config=history_config,
         action_horizon=action_horizon,
-        compute_norm_stats=compute_norm_stats)
+        compute_norm_stats=compute_norm_stats,
+    )
+    if dataset_type == "bin":
+        dataset_kwargs["num_read_threads"] = num_read_threads
+
+    dataset = dataset_cls(**dataset_kwargs)
 
     dataset = TransformedDataset(
         dataset,
@@ -89,12 +95,15 @@ def main(
     dataset_type: str = "npy",
     history_config_path: str = "src/mme_vla_suite/models/config/robomme/perceptual-framesamp-modul_hard.yaml",
     num_workers: int = 4,
-    batch_size: int = 64
+    batch_size: int = 64,
+    num_read_threads: int = 1,
 ):
     """Benchmark dataloader speed for npy / bin / mmap backends.
 
     Args:
         dataset_type: One of "npy", "bin", "mmap".
+        num_read_threads: Per-sample read parallelism for the "bin" loader only.
+            1 = sequential. Try 4-16 for recurrent configs (64 frames per sample).
     """
     config = _config.get_config(config_name)
     config = dataclasses.replace(config, data=dataclasses.replace(config.data, repo_id=repo_id))
@@ -110,6 +119,7 @@ def main(
         action_horizon=config.model.action_horizon,
         batch_size=batch_size,
         num_workers=num_workers,
+        num_read_threads=num_read_threads,
         compute_norm_stats=True,
         dataset_type=dataset_type,
     )
@@ -195,4 +205,3 @@ if __name__ == "__main__":
 # Median (p50):    4.974s
 # p95:             11.119s
 # Throughput:      12.1 samples/s
-

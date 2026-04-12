@@ -10,6 +10,7 @@ Only the resolution needed by the current config is read from disk.
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import ml_dtypes
 import numpy as np
@@ -47,9 +48,18 @@ def _resolve_resolution(history_config):
 
 
 class RoboMMEDatasetBin(RoboMMEDataset):
-    """Loads history features from per-episode .bin files via seek."""
+    """Loads history features from per-episode .bin files via seek.
 
-    def __init__(self, *args, bin_features_dir=None, **kwargs):
+    Parameters
+    ----------
+    num_read_threads : int
+        If > 1, parallelize per-frame reads across this many threads.  Each task
+        does all 3 preads (img + pos + state) for one frame, so NFS latency is
+        overlapped.  Recommended ~4-16 for recurrent configs (64 frames); keep at
+        1 for frame-sampling (3-8 frames) since thread dispatch overhead dominates.
+    """
+
+    def __init__(self, *args, bin_features_dir=None, num_read_threads: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
         self.bin_dir = bin_features_dir or os.path.join(
             self.dataset.dataset_path, "features_bin")
@@ -72,6 +82,11 @@ class RoboMMEDatasetBin(RoboMMEDataset):
         self._img_fds = {}
         self._pos_fds = {}
         self._state_fds = {}
+
+        # Read-parallelism config. Executor is lazy so it's created *after* the
+        # DataLoader fork (avoids sharing threads across worker processes).
+        self._num_read_threads = int(num_read_threads)
+        self._executor = None
 
     def _ensure_frame_sizes(self, V, state_dim):
         if self._frame_sizes_ready:
@@ -104,6 +119,31 @@ class RoboMMEDatasetBin(RoboMMEDataset):
             step_idx, token_budget, self._gather_history_feat,
             kept_indices=kept_indices, epis_idx=epis_idx)
 
+    def _get_executor(self):
+        """Lazily create a ThreadPoolExecutor per worker process (post-fork)."""
+        if self._num_read_threads <= 1:
+            return None
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._num_read_threads)
+        return self._executor
+
+    def _read_one_frame(self, frame_idx, V, tokens, state_dim,
+                        img_fd, pos_fd, state_fd, img_key, pos_key):
+        """Read img + pos + state for a single frame. Thread-safe (uses pread)."""
+        img_raw = os.pread(img_fd, self._img_frame_bytes,
+                           frame_idx * self._img_frame_bytes)
+        img = np.frombuffer(img_raw, dtype=ml_dtypes.bfloat16).reshape(V, tokens, IMG_DIM)
+
+        pos_raw = os.pread(pos_fd, self._pos_frame_bytes,
+                           frame_idx * self._pos_frame_bytes)
+        pos = np.frombuffer(pos_raw, dtype=np.float32).reshape(V, tokens, POS_DIM)
+
+        state_raw = os.pread(state_fd, self._state_frame_bytes,
+                             frame_idx * self._state_frame_bytes)
+        state = np.frombuffer(state_raw, dtype=np.float32).reshape(state_dim)
+
+        return frame_idx, {img_key: img, pos_key: pos, "state_emb": state}
+
     def _gather_history_feat(self, indices_to_load, epis_idx):
         epis_key = f"episode_{epis_idx}"
         meta = self.bin_meta[epis_key]
@@ -117,24 +157,29 @@ class RoboMMEDatasetBin(RoboMMEDataset):
         img_key = f"image_emb_{res}"
         pos_key = f"pos_emb_{res}"
 
+        executor = self._get_executor() if len(indices_to_load) > 1 else None
         history_feats = {}
-        for frame_idx in indices_to_load:
-            # os.pread bypasses Python's BufferedReader — one syscall, no extra buffering.
-            # np.frombuffer(bytes, ...) returns a read-only view; downstream code only reads
-            # or calls np.stack/concatenate (both allocate new arrays), so no copy is needed.
-            raw = os.pread(img_fd, self._img_frame_bytes, frame_idx * self._img_frame_bytes)
-            img = np.frombuffer(raw, dtype=ml_dtypes.bfloat16).reshape(V, tokens, IMG_DIM)
 
-            raw = os.pread(pos_fd, self._pos_frame_bytes, frame_idx * self._pos_frame_bytes)
-            pos = np.frombuffer(raw, dtype=np.float32).reshape(V, tokens, POS_DIM)
-
-            raw = os.pread(state_fd, self._state_frame_bytes, frame_idx * self._state_frame_bytes)
-            state = np.frombuffer(raw, dtype=np.float32).reshape(state_dim)
-
-            history_feats[frame_idx] = {
-                img_key: img,
-                pos_key: pos,
-                "state_emb": state,
-            }
+        if executor is not None:
+            # Parallel path: each task does 3 preads for one frame. os.pread is
+            # thread-safe (atomic at offset), and the GIL is released during the
+            # syscall, so NFS latency is overlapped across threads.
+            futures = [
+                executor.submit(
+                    self._read_one_frame, fi, V, tokens, state_dim,
+                    img_fd, pos_fd, state_fd, img_key, pos_key,
+                )
+                for fi in indices_to_load
+            ]
+            for future in futures:
+                fi, feats = future.result()
+                history_feats[fi] = feats
+        else:
+            # Sequential path (low overhead for small frame counts).
+            for frame_idx in indices_to_load:
+                _, history_feats[frame_idx] = self._read_one_frame(
+                    frame_idx, V, tokens, state_dim,
+                    img_fd, pos_fd, state_fd, img_key, pos_key,
+                )
 
         return history_feats

@@ -57,6 +57,7 @@ def create_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     dataset_type: str = "npy",
+    num_read_threads: int = 1,
 ) -> DataLoader[tuple[HistAugObservation, _model.Actions]]:
 
     history_config = get_history_config(history_config)
@@ -68,12 +69,18 @@ def create_data_loader(
     dataset_cls = DATASET_CLASSES[dataset_type]
     logging.info(f"Using dataset class: {dataset_cls.__name__} (dataset_type='{dataset_type}')")
 
-    dataset = dataset_cls(
+    dataset_kwargs = dict(
         dataset_path=dataset_path,
         data_config=data_config,
         history_config=history_config,
         action_horizon=action_horizon,
     )
+    # Only the bin loader supports multi-threaded reads (mmap uses the kernel
+    # page cache, npy uses its own ThreadPoolExecutor already).
+    if dataset_type == "bin":
+        dataset_kwargs["num_read_threads"] = num_read_threads
+
+    dataset = dataset_cls(**dataset_kwargs)
     
     dataset = transform_dataset(
         dataset, data_config, skip_norm_stats=skip_norm_stats)

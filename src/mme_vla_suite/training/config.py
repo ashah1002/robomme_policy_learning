@@ -535,6 +535,12 @@ class TrainConfig:
     #   "mmap" — per-episode .bin files via np.memmap (features_bin/, fastest on local SSD)
     dataset_type: Literal["npy", "bin", "mmap"] = "npy"
 
+    # Number of threads used to parallelize per-frame reads in the "bin" loader.
+    # 1 = sequential (best for <~8 frames per sample, e.g. frame sampling).
+    # 4-16 = overlap NFS latency (best for recurrent configs loading 64 frames).
+    # Ignored for "npy" (uses its own pool) and "mmap" (uses OS page cache).
+    num_read_threads: int = 1
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""

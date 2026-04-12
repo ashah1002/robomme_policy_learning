@@ -88,7 +88,7 @@ def main(
     dataset_path: str = "data/robomme_preprocessed_data",
     dataset_type: str = "npy",
     history_config_path: str = "src/mme_vla_suite/models/config/robomme/perceptual-framesamp-modul_hard.yaml",
-    num_workers: int = 0,
+    num_workers: int = 4,
     batch_size: int = 64
 ):
     """Benchmark dataloader speed for npy / bin / mmap backends.
@@ -149,13 +149,6 @@ if __name__ == "__main__":
 
 # Turbo
 # Recurrent
-# --- Results (mmap) ---
-# Total time:      445.9s for 99 batches
-# Avg batch time:  4.504s
-# Median (p50):    1.700s
-# p95:             13.675s
-# Throughput:      14.2 samples/s
-
 # --- Results (npy) ---
 # Total time:      447.1s for 99 batches
 # Avg batch time:  4.516s
@@ -163,15 +156,23 @@ if __name__ == "__main__":
 # p95:             8.227s
 # Throughput:      14.2 samples/s
 
-# Bin has mistake. I dont know why
+# --- Results (mmap) ---
+# Total time:      445.9s for 99 batches
+# Avg batch time:  4.504s
+# Median (p50):    1.700s
+# p95:             13.675s
+# Throughput:      14.2 samples/s
 
-# FrameSamp
+
+
+# FrameSamp (512)
 # --- Results (npy) ---
 # Total time:      272.8s for 99 batches
 # Avg batch time:  2.756s
 # Median (p50):    0.492s
 # p95:             11.865s
 # Throughput:      23.2 samples/s
+
 # --- Results (bin) ---
 # Total time:      104.3s for 99 batches
 # Avg batch time:  1.053s
@@ -181,4 +182,17 @@ if __name__ == "__main__":
 
 
 # FrameSamp Hard (4096, 64)
-# Still npy is the best...
+# --- Results (npy) ---
+# Total time:      548.0s for 99 batches
+# Avg batch time:  5.535s
+# Median (p50):    0.723s
+# p95:             20.308s
+# Throughput:      11.6 samples/s
+
+# --- Results (bin) ---
+# Total time:      524.2s for 99 batches
+# Avg batch time:  5.295s
+# Median (p50):    4.974s
+# p95:             11.119s
+# Throughput:      12.1 samples/s
+

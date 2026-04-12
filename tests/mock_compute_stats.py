@@ -1,16 +1,3 @@
-"""
-Final benchmark
-  ┌─────────────────┬───────────┬─────────────┬───────┬───────┬──────────────┐
-  │     Config      │ npy (old) │ npy (fixed) │  bin  │ mmap  │ best speedup │
-  ├─────────────────┼───────────┼─────────────┼───────┼───────┼──────────────┤
-  │ framesamp (4x4) │ 43.4ms    │ 19.9ms      │ 4.2ms │ 3.8ms │ 11.4x        │
-  ├─────────────────┼───────────┼─────────────┼───────┼───────┼──────────────┤
-  │ tokendrop (8x8) │ 20.3ms    │ 17.3ms      │ 8.0ms │ 8.2ms │ 2.5x         │
-  ├─────────────────┼───────────┼─────────────┼───────┼───────┼──────────────┤
-  │ recurrent (8x8) │ 58.8ms    │ 13.3ms      │ 5.8ms │ 5.3ms │ 11.1x        │
-  └─────────────────┴───────────┴─────────────┴───────┴───────┴──────────────┘
-"""
-
 import time
 
 import tqdm
@@ -114,32 +101,18 @@ def main(
         dataset_type=dataset_type,
     )
 
-    warmup_batches = 10
-    max_batches = 100
-    num_batches = min(num_batches, warmup_batches + max_batches)
     print(f"\n=== Benchmarking dataset_type={dataset_type}, num_workers={num_workers}, batch_size={batch_size} ===")
-    print(f"Warming up {warmup_batches} batches, then timing {max_batches} batches...")
+    print(f"Running {num_batches} batches...")
+    
+    keys = ["state", "actions"]
+    stats = {key: normalize.RunningStats() for key in keys}
 
-    times = []
-    for i, batch in enumerate(tqdm.tqdm(data_loader, total=num_batches, desc=f"[{dataset_type}]")):
-        if i >= warmup_batches:
-            times.append(time.time())
-        if i + 1 >= num_batches:
-            break
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        for key in keys:
+            stats[key].update(np.asarray(batch[key]))
 
-    if len(times) > 1:
-        intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
-        total = times[-1] - times[0]
-        avg = np.mean(intervals)
-        p50 = np.median(intervals)
-        p95 = np.percentile(intervals, 95)
-        samples_per_sec = batch_size / avg
-        print(f"\n--- Results ({dataset_type}) ---")
-        print(f"Total time:      {total:.1f}s for {len(intervals)} batches")
-        print(f"Avg batch time:  {avg:.3f}s")
-        print(f"Median (p50):    {p50:.3f}s")
-        print(f"p95:             {p95:.3f}s")
-        print(f"Throughput:      {samples_per_sec:.1f} samples/s")
+    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    print(f"norm_stats: {norm_stats}")
         
 
 if __name__ == "__main__":

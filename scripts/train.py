@@ -366,7 +366,8 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         action_horizon=config.model.action_horizon,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
-        seed=config.seed
+        seed=config.seed,
+        dataset_type=config.dataset_type,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)

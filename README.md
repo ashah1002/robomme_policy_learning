@@ -29,6 +29,7 @@
 
 ## 🗞️ Updates
 
+- [04/2026] We improve our dataloader for faster data loading, see more details [here]()
 - [03/2026] We use MME-VLA (FrameSamp+Modul) as an example for RoboMME Challenge @ CVPR2026 Submission. Please see [here](https://github.com/RoboMME/robomme_policy_learning?tab=readme-ov-file#robomme-challenge-example) for more details.
 - [03/2026] We provide MME-VLA as a submission example for CVPR RoboMME Challenge. More details can be found [here](#robomme-challenge).
 - [03/2026] 🚀 We release MME-VLA Suite, a family of memory-augmented vision-language-action (VLA) models based on the $\pi_{0.5}$ backbone. See our [paper](https://arxiv.org/abs/2603.04639) and [leaderboard](https://robomme.github.io/leaderboard.html) for more details and analysis.
@@ -115,7 +116,8 @@ All possible configs can be found in `src/mme_vla_suite/models/config/robomme`
 │   ├── robomme_h5_data                 # download robomme raw h5 files here
 │   └── robomme_preprocessed_data
 │   │   ├── data                        # pickle files
-│   │   ├── features                    # precompute siglip token embeddings
+│   │   ├── features                    # precompute siglip token embeddings (.npy, default loader)
+│   │   ├── features_bin                # repacked .bin files (optional, for bin/mmap loaders)
 │   │   ├── meta                        # statistics for robomme
 │   │   ├── memer                       # VLM subgoal training data for MemER
 │   │   └── qwenvl                      # VLM subgoal training data for QwenVL
@@ -236,6 +238,57 @@ This produces the following structure under `runs`:
 ```
 
 You can also compare against our reference `norm_stats.json` provided [here](assets/norm_stats.json) to check whether your processing is correct. Small differences are acceptable.
+
+### ⚡ (Optional) Fast dataloader — convert features to `.bin`
+
+The default `RoboMMEDataset` loads history features from `features/episode_X/token_emb_*.npy` — one pickled file per frame (≈150 k files per 1600-episode dataset). Each training sample opens and unpickles 5–64 of these files, which becomes the main bottleneck on NFS storage.
+
+We provide two faster alternatives that use the same feature data repacked into per-episode `.bin` files:
+
+| Loader | Backend | Best for |
+|---|---|---|
+| `bin` | `os.pread` on cached file descriptors | NFS-mounted datasets, strict safety |
+| `mmap` | `np.memmap` | Local SSD, fastest overall |
+
+**Storage layout** under `features_bin/` (per resolution, per episode):
+```
+features_bin/
+├── image_emb_{8x8,4x4,2x2}/episode_N.bin   # bf16
+├── pos_emb_{8x8,4x4,2x2}/episode_N.bin     # f32
+├── state/episode_N.bin                      # f32
+├── kept_indices/episode_N.json              # copied for token-dropping mode
+└── metadata.json
+```
+
+Each training run only reads the one resolution its memory config needs (e.g. `framesamp-modul` → 4x4, `tokendrop-modul`/`recurrent-ttt-modul` → 8x8).
+
+**Conversion (one-time, runs on the existing `features/` directory):**
+```bash
+uv run scripts/convert_features_to_bin.py \
+  --features_dir data/robomme_preprocessed_data/features \
+  --output_dir data/robomme_preprocessed_data/features_bin
+```
+
+**Measured speedups** on `data/robomme_preprocessed_data_sample` (per-sample `__getitem__` timing, warm page cache):
+
+| History config | `npy` | `bin` | `mmap` |
+|---|---|---|---|
+| no-history (baseline) | 5.3 ms | 2.4 ms | 2.7 ms |
+| perceptual-framesamp-modul (4x4) | 22.9 ms | 5.8 ms | **4.0 ms** |
+| perceptual-tokendrop-modul (8x8) | 17.8 ms | **8.2 ms** | 8.9 ms |
+| recurrent-ttt-modul (8x8) | 34.8 ms | 25.8 ms | **21.1 ms** |
+
+
+**Using a new loader during training** — pass `--dataset-type={npy,bin,mmap}` on the CLI. Default is `npy` for backward compatibility:
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 uv run scripts/train.py mme_vla_suite \
+  --exp-name=<model_name> \
+  --batch-size=64 --num-workers=4 --fsdp-devices=4 \
+  --dataset-path=data/robomme_preprocessed_data \
+  --dataset-type=mmap \
+  --model.use_history \
+  --model.history_config="${MME_VLA_TYPE}.yaml"
+```
 
 ### 🎛️ Train π₀.₅ baseline
 This variant does not use history and fine-tunes the $\pi_{0.5}$ checkpoints with the vision encoder frozen (for comparison with MME-VLA):

@@ -21,38 +21,35 @@ def right_padding_token_emb(
     mask, # (l)
     max_size: int):
     if sampled_img_emb.shape[0] < max_size:
+        pad_img = max_size - sampled_img_emb.shape[0]
         sampled_img_emb = np.concatenate(
             [
                 sampled_img_emb,
                 np.zeros(
-                    (
-                        max_size - sampled_img_emb.shape[0],
-                        *sampled_img_emb.shape[1:],
-                    )
+                    (pad_img, *sampled_img_emb.shape[1:]),
+                    dtype=sampled_img_emb.dtype,
                 ),
             ],
             axis=0,
         )
+        pad_pos = max_size - sampled_pos_emb.shape[0]
         sampled_pos_emb = np.concatenate(
             [
                 sampled_pos_emb,
                 np.zeros(
-                    (
-                        max_size - sampled_pos_emb.shape[0],
-                        *sampled_pos_emb.shape[1:],
-                    )
+                    (pad_pos, *sampled_pos_emb.shape[1:]),
+                    dtype=sampled_pos_emb.dtype,
                 ),
             ],
             axis=0,
         )
+        pad_state = max_size - sampled_state_emb.shape[0]
         sampled_state_emb = np.concatenate(
             [
                 sampled_state_emb,
                 np.zeros(
-                    (
-                        max_size - sampled_state_emb.shape[0],
-                        *sampled_state_emb.shape[1:],
-                    )
+                    (pad_state, *sampled_state_emb.shape[1:]),
+                    dtype=sampled_state_emb.dtype,
                 ),
             ],
             axis=0,
@@ -77,37 +74,34 @@ def left_padding_token_emb(
     max_recur_steps: int
 ):
     if recur_image_emb.shape[0] < max_recur_steps:
+        pad_img = max_recur_steps - recur_image_emb.shape[0]
         recur_image_emb = np.concatenate(
             [
                 np.zeros(
-                    (
-                        max_recur_steps - recur_image_emb.shape[0],
-                        *recur_image_emb.shape[1:],
-                    )
+                    (pad_img, *recur_image_emb.shape[1:]),
+                    dtype=recur_image_emb.dtype,
                 ),
                 recur_image_emb,
             ],
             axis=0,
         )
+        pad_pos = max_recur_steps - recur_pos_emb.shape[0]
         recur_pos_emb = np.concatenate(
             [
                 np.zeros(
-                    (
-                        max_recur_steps - recur_pos_emb.shape[0],
-                        *recur_pos_emb.shape[1:],
-                    )
+                    (pad_pos, *recur_pos_emb.shape[1:]),
+                    dtype=recur_pos_emb.dtype,
                 ),
                 recur_pos_emb,
             ],
             axis=0,
         )
+        pad_state = max_recur_steps - recur_state_emb.shape[0]
         recur_state_emb = np.concatenate(
             [
                 np.zeros(
-                    (
-                        max_recur_steps - recur_state_emb.shape[0],
-                        *recur_state_emb.shape[1:],
-                    )
+                    (pad_state, *recur_state_emb.shape[1:]),
+                    dtype=recur_state_emb.dtype,
                 ),
                 recur_state_emb,
             ],

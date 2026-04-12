@@ -526,8 +526,14 @@ class TrainConfig:
     fsdp_devices: int = 1
         
     resum_ckpt_id: int | None = None
-    
+
     dataset_path: str = "data/robomme"
+
+    # Which dataset loader to use for history features.
+    #   "npy"  — original per-frame .npy files (features/)
+    #   "bin"  — per-episode .bin files via seek (features_bin/)
+    #   "mmap" — per-episode .bin files via np.memmap (features_bin/, fastest on local SSD)
+    dataset_type: Literal["npy", "bin", "mmap"] = "npy"
 
     @property
     def assets_dirs(self) -> pathlib.Path:

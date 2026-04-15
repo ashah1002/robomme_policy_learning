@@ -91,7 +91,7 @@ class HistoryPi0Config(Pi0Config):
             config_with_loaded_history = dataclasses.replace(self, history_config=loaded_config)
             
             max_token_len = self.max_token_len
-            if loaded_config.representation_type == "symbolic":
+            if loaded_config.representation_type in ("symbolic", "hybrid"):
                 if loaded_config.symbolic_memory.type in ["simple_subgoal", "grounded_subgoal"]:
                     max_token_len *= 2
                 else:
@@ -114,6 +114,55 @@ class HistoryPi0Config(Pi0Config):
                 if self.history_config.representation_type == "symbolic":
                     observation_spec = HistAugObservation.from_base_obs(
                         base_obs_spec,
+                        symbolic_tokenized_prompt=jax.ShapeDtypeStruct(
+                            [batch_size, self.max_token_len], jnp.int32
+                        ),
+                        symbolic_tokenized_prompt_mask=jax.ShapeDtypeStruct(
+                            [batch_size, self.max_token_len], bool
+                        ),
+                    )
+                elif self.history_config.representation_type == "hybrid":
+                    observation_spec = HistAugObservation.from_base_obs(
+                        base_obs_spec,
+                        static_image_emb=jax.ShapeDtypeStruct(
+                            [
+                                batch_size,
+                                self.history_config.perceptual_memory.budget
+                                if hasattr(self.history_config.perceptual_memory, "budget")
+                                else self.history_config.budget,
+                                self.history_config.memory_feature.img.input_dim,
+                            ],
+                            jnp.float32,
+                        ),
+                        static_mask=jax.ShapeDtypeStruct(
+                            [
+                                batch_size,
+                                self.history_config.perceptual_memory.budget
+                                if hasattr(self.history_config.perceptual_memory, "budget")
+                                else self.history_config.budget,
+                            ],
+                            jnp.bool_,
+                        ),
+                        static_pos_emb=jax.ShapeDtypeStruct(
+                            [
+                                batch_size,
+                                self.history_config.perceptual_memory.budget
+                                if hasattr(self.history_config.perceptual_memory, "budget")
+                                else self.history_config.budget,
+                                self.history_config.memory_feature.pos.input_dim,
+                            ],
+                            jnp.float32,
+                        ),
+                        static_state_emb=jax.ShapeDtypeStruct(
+                            [
+                                batch_size,
+                                self.history_config.perceptual_memory.budget
+                                if hasattr(self.history_config.perceptual_memory, "budget")
+                                else self.history_config.budget,
+                                self.history_config.memory_feature.state.input_dim,
+                            ],
+                            jnp.float32,
+                        ),
                         symbolic_tokenized_prompt=jax.ShapeDtypeStruct(
                             [batch_size, self.max_token_len], jnp.int32
                         ),
@@ -249,9 +298,19 @@ class HistoryPi0(BaseModel):
             self.integration_type = config.history_config.integration_type
             self.representation_type = config.history_config.representation_type
             assert self.integration_type in ["context", "modulation", "expert"]
-            assert self.representation_type in ["perceptual", "recurrent", "symbolic"]
+            assert self.representation_type in ["perceptual", "recurrent", "symbolic", "hybrid"]
 
-            if self.representation_type == "perceptual":
+            if self.representation_type == "hybrid":
+                from mme_vla_suite.models.representation.percep_mem import (
+                    PerceptualMemory,
+                )
+
+                self.mem_encoder = PerceptualMemory(
+                    config=self.history_config,
+                    rngs=rngs,
+                    dtype=config.dtype,
+                )
+            elif self.representation_type == "perceptual":
                 from mme_vla_suite.models.representation.percep_mem import (
                     PerceptualMemory,
                 )
@@ -283,7 +342,7 @@ class HistoryPi0(BaseModel):
             print(
                 f"====== Using History, Representation Type: {self.representation_type} , Integration Type: {self.integration_type} ======"
             )
-            if self.representation_type == "perceptual":
+            if self.representation_type in ("perceptual", "hybrid"):
                 print(f"Perceptual Memory using {self.history_config.perceptual_memory.type} type\n")
             elif self.representation_type == "recurrent":
                 print(f"Recurrent Memory using {self.history_config.recurrent_memory.type} type\n")
@@ -393,7 +452,7 @@ class HistoryPi0(BaseModel):
 
     @at.typecheck
     def embed_memory(self, obs: HistAugObservation):
-        if self.representation_type == "perceptual":
+        if self.representation_type in ("perceptual", "hybrid"):
             tokens, _, stats = self.mem_encoder(
                 obs.static_image_emb, obs.static_pos_emb, obs.static_state_emb
             )
@@ -465,7 +524,7 @@ class HistoryPi0(BaseModel):
             na_mask += [True] * image_tokens.shape[1]
 
         # add language (aka tokenized inputs)
-        if self.use_history and self.representation_type == "symbolic":
+        if self.use_history and self.representation_type in ("symbolic", "hybrid"):
             tokenized_inputs = self.PaliGemma.llm(
                 obs.symbolic_tokenized_prompt, method="embed"
             )
@@ -599,7 +658,7 @@ class HistoryPi0(BaseModel):
             ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
             na_mask = jnp.concatenate([prefix_na_mask, suffix_na_mask], axis=0)
 
-        if self.use_history and self.representation_type != "symbolic":
+        if self.use_history and self.representation_type not in ("symbolic", "hybrid"):
             attn_mask = make_attn_mask(input_mask, ar_mask, na_mask)
         else:
             attn_mask = make_attn_mask(input_mask, ar_mask)

@@ -62,7 +62,7 @@ class RoboMMEDataset(Dataset):
             self.num_views = self.history_config.num_views
             self.streaming_obs_horizon = self.history_config.streaming_obs_horizon
         
-            if self.history_config.representation_type == "perceptual":
+            if self.history_config.representation_type in ("perceptual", "hybrid"):
                 self.mem_buffer = MemoryBuffer(
                     num_views=self.num_views,
                     img_emb_dim=self.img_emb_dim,
@@ -196,7 +196,7 @@ class RoboMMEDataset(Dataset):
         # To make the model robust to this temporal shift and avoid train/test distribution mismatch,
         # we randomly sample from either subgoal or subgoal_online (early change).
         if self.history_config is not None \
-            and self.history_config.representation_type == "symbolic" \
+            and self.history_config.representation_type in ("symbolic", "hybrid") \
             and self.history_config.symbolic_memory.type in ["simple_subgoal", "grounded_subgoal"] \
             and random.random() < 0.5: 
             data["simple_subgoal"] = data["simple_subgoal_online"]
@@ -204,7 +204,7 @@ class RoboMMEDataset(Dataset):
         data.pop("simple_subgoal_online")
         data.pop("grounded_subgoal_online")
         
-        if self.history_config is not None and self.history_config.representation_type == "symbolic":
+        if self.history_config is not None and self.history_config.representation_type in ("symbolic", "hybrid"):
             data["grounded_subgoal"] = self.add_grounding_augmentation(data["grounded_subgoal"], noise_range=8)
             data["simple_subgoal"] = self.add_grounding_augmentation(data["simple_subgoal"], noise_range=8)
  
@@ -215,7 +215,7 @@ class RoboMMEDataset(Dataset):
             step_idx = data["step_idx"].item()
             exec_start_idx = data["exec_start_idx"].item()
 
-            if self.history_config.representation_type == "perceptual":
+            if self.history_config.representation_type in ("perceptual", "hybrid"):
                 if self.history_config.perceptual_memory.type == "token_dropping":
                     (
                         static_img_emb,

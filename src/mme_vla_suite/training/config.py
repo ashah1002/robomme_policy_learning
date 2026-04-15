@@ -237,9 +237,9 @@ class ModelTransformFactory(GroupFactory):
                 if model_config.use_history and model_config.history_config is not None:
                     loaded_config = get_history_config(model_config.history_config)
 
-                    if loaded_config.representation_type == "symbolic":
+                    if loaded_config.representation_type in ("symbolic", "hybrid"):
                         symbolic_memory_type = loaded_config.symbolic_memory.type
-                        max_token_len *= 2 # it's enough for subgoals, no need to set into 512.
+                        max_token_len *= 2
                 
                 print(f"max_token_len: {max_token_len}")
                 

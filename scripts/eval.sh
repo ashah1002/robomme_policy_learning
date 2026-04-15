@@ -14,6 +14,9 @@
 # recurrent-rmt-context, recurrent-rmt-modul, recurrent-rmt-expert
 # recurrent-ttt-context, recurrent-ttt-modul, recurrent-ttt-expert
 
+# Hybrid Memory (perceptual + symbolic via MemER):
+# hybrid_memer
+
 # set the MODEL_TYPE from the list above according to your needs
 
 #### set your own parameters ####
@@ -76,6 +79,10 @@ else
     elif [ "$MODEL_TYPE" == "MemER" ]; then
         EXTRA_ARGS="--args.use-memer --args.subgoal-type=grounded_subgoal"
         MODEL_TYPE="symbolic-grounded-subgoal" # we use grounded subgoal for MemER in our experiments
+
+    elif [ "$MODEL_TYPE" == "hybrid_memer" ]; then
+        EXTRA_ARGS="--args.use-memer --args.subgoal-type=grounded_subgoal"
+        MODEL_TYPE="hybrid-framesamp-modul"
     
     # perceptual_memory or recurrent_memory
     else

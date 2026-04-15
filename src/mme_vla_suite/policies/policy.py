@@ -51,6 +51,16 @@ class MME_VLA_Policy:
     def _prepare_mem_buffer(self):
         if self.config is None or self.config.representation_type == "symbolic":
             self.mem_buffer = None
+        elif self.config.representation_type == "hybrid":
+            self.mem_buffer = MemoryBuffer(
+                num_views=self.config.num_views,
+                img_emb_dim=self.config.memory_feature.img.input_dim,
+                pos_emb_dim=self.config.memory_feature.pos.input_dim,
+                state_emb_dim=self.config.memory_feature.state.input_dim,
+                compute_token_drop_score=self.config.perceptual_memory.type == "token_dropping",
+                token_drop_stride=self.config.streaming_obs_horizon // 2,
+                prepare_buffer=True, vision_enc_fn=self._vision_encode,
+            )
         elif self.config.representation_type == "recurrent":
             self.mem_buffer = MemoryBufferRecurrent(
                 num_views=self.config.num_views,
@@ -75,7 +85,7 @@ class MME_VLA_Policy:
 
     @override
     def infer(self, obs: dict) -> dict:
-        if self.config is not None and self.config.representation_type != "symbolic":
+        if self.config is not None and self.config.representation_type not in ("symbolic",):
             assert len(self.mem_buffer._history_feats) > 0, \
                 "history feats is empty, add buffer first"
                                         
@@ -139,7 +149,7 @@ class MME_VLA_Policy:
             inputs["recur_pos_emb"] = recur_pos_emb
             inputs["recur_state_emb"] = self._normalize_state(recur_state_emb)
             inputs["recur_mask"] = recur_mask
-        elif self.config.representation_type == "perceptual":
+        elif self.config.representation_type in ("perceptual", "hybrid"):
             history_feats_gather_fn = self.mem_buffer.default_history_feats_gather_fn
             token_budget = self.config.budget
             

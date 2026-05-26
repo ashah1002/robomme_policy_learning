@@ -207,3 +207,13 @@ marimo/_lsp/
 __marimo__/
 
 *local.sh
+
+# Local notes, papers, implementation plans (not for GitHub)
+notes/
+
+# Local cluster Slurm scripts (iliad paths, sbatch) — not for public repo
+scripts/cluster/
+
+# macOS
+.DS_Store
+**/.DS_Store

@@ -1,5 +1,5 @@
 # Hybrid Memory VLA: FrameSamp perceptual memory (modulation) + MemER symbolic subtask memory
-# Combines dense perceptual memory with hierarchical subtask prediction
+# Combines dense perceptual memory with hierarchical subtask prediction (MemER at eval time).
 
 MME_VLA_TYPE="hybrid-framesamp-modul"
 

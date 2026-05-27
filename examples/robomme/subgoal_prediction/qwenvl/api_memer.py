@@ -27,7 +27,7 @@ class Qwen3VLModelMemER:
         self.engine = PtEngine(
             model_id_or_path='Qwen/Qwen3-VL-4B-Instruct',
             adapters=[adapter_path],
-            attn_impl='flash_attention_2' #'sdpa'
+            attn_impl='sdpa' #'sdpa'
         )
         
         
@@ -252,6 +252,12 @@ class Qwen3VLModelMemER:
             subgoal = self._parse_subgoal_for_vla(response)
         except Exception as e:
             print(f"Error updating history subgoals: {e}")
-            subgoal = self.subgoals[-1]
+            if self.subgoals:
+                subgoal = self.subgoals[-1]
+            else:
+                # VLM sometimes returns plain text instead of JSON; still usable for the VLA.
+                subgoal = self._parse_box_patterns(
+                    response, replacement="scaled_coords", return_bbox=False
+                )
                     
         return subgoal

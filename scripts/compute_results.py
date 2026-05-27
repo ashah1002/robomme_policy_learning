@@ -27,7 +27,7 @@ DIR = Path("runs/evaluation")
 MODEL_DIR = args.model_dir
 SYMBOLIC_TYPE = args.symbolic_type
 
-if "symbolic" in MODEL_DIR:
+if "symbolic" in MODEL_DIR or "hybrid" in MODEL_DIR:
     assert SYMBOLIC_TYPE in ["oracle", "gemini", "qwenvl", "memer"], "Invalid symbolic type"
 else:
     assert SYMBOLIC_TYPE == "", "Symbolic type is not supported for this model type"

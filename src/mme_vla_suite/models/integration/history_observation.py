@@ -34,6 +34,9 @@ class HistAugObservation(_Observation):
     symbolic_tokenized_prompt: at.Int[at.Array, "b l2"] | None = None
     symbolic_tokenized_prompt_mask: at.Bool[at.Array, "b l2"] | None = None
 
+    # for TAG memory gate supervision (train only)
+    needs_memory: at.Float[at.Array, "b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "HistAugObservation":
         parent_obs = super().from_dict(data)
@@ -59,6 +62,7 @@ class HistAugObservation(_Observation):
             symbolic_tokenized_prompt_mask=data.get(
                 "symbolic_tokenized_prompt_mask", None
             ),
+            needs_memory=data.get("needs_memory", None),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -73,6 +77,7 @@ class HistAugObservation(_Observation):
         result["recur_state_emb"] = self.recur_state_emb
         result["symbolic_tokenized_prompt"] = self.symbolic_tokenized_prompt  #  subgoal
         result["symbolic_tokenized_prompt_mask"] = self.symbolic_tokenized_prompt_mask
+        result["needs_memory"] = self.needs_memory
         return result
 
     def to_base_obs(self) -> _Observation:
@@ -100,6 +105,7 @@ class HistAugObservation(_Observation):
         recur_state_emb: at.Float[ArrayT, "*b t d3"] | None = None,
         symbolic_tokenized_prompt: at.Int[ArrayT, "*b l d5"] | None = None,
         symbolic_tokenized_prompt_mask: at.Bool[ArrayT, "*b l d6"] | None = None,
+        needs_memory: at.Float[ArrayT, "*b"] | None = None,
     ) -> "HistAugObservation":
         return HistAugObservation(
             images=base_obs.images,
@@ -119,6 +125,7 @@ class HistAugObservation(_Observation):
             recur_state_emb=recur_state_emb,
             symbolic_tokenized_prompt=symbolic_tokenized_prompt,
             symbolic_tokenized_prompt_mask=symbolic_tokenized_prompt_mask,
+            needs_memory=needs_memory,
         )
 
 
@@ -146,4 +153,5 @@ def preprocess_observation(
         recur_state_emb=observation.recur_state_emb,
         symbolic_tokenized_prompt=observation.symbolic_tokenized_prompt,
         symbolic_tokenized_prompt_mask=observation.symbolic_tokenized_prompt_mask,
+        needs_memory=observation.needs_memory,
     )

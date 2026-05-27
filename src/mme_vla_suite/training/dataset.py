@@ -11,6 +11,7 @@ import re
 from openpi.training import config as _config
 from openpi.training.data_loader import Dataset
 from mme_vla_suite.shared.mem_buffer import MemoryBuffer, MemoryBufferRecurrent
+from mme_vla_suite.models.config.utils import history_flag
 import pickle
 
 random.seed(0)
@@ -87,6 +88,8 @@ class RoboMMEDataset(Dataset):
             logger.info("=== Do not use history ===")
         
         self.compute_norm_stats = compute_norm_stats
+        
+        self._boundary_cache: dict[int, int] = {}
         
         if not compute_norm_stats:
             self.state_norm_stats = data_config.norm_stats['state']
@@ -185,6 +188,39 @@ class RoboMMEDataset(Dataset):
 
         new_subgoal = subgoal.replace(f'at <{x}, {y}>', f'at <{x + noise_x}, {y + noise_y}>')
         return new_subgoal
+
+    def _compute_needs_memory(self, idx: int, data: dict) -> np.float32:
+        epis_idx = int(data["epis_idx"])
+        step_idx = int(data["step_idx"])
+        exec_start_idx = int(data["exec_start_idx"])
+        subgoal = data.get("simple_subgoal")
+        window_steps = int(
+            getattr(self.history_config.memory_gate, "window_steps", 8)
+        )
+
+        boundary = False
+        if step_idx == exec_start_idx:
+            boundary = True
+        elif idx > 0:
+            prev = self.dataset[idx - 1]
+            prev_epis = int(prev["epis_idx"])
+            if prev_epis != epis_idx:
+                boundary = True
+            elif subgoal != prev.get("simple_subgoal"):
+                boundary = True
+        else:
+            boundary = True
+
+        if boundary:
+            self._boundary_cache[epis_idx] = step_idx
+
+        last_boundary = self._boundary_cache.get(epis_idx)
+        if last_boundary is None:
+            in_window = boundary
+        else:
+            in_window = (step_idx - last_boundary) < window_steps
+
+        return np.float32(1.0 if in_window else 0.0)
         
 
     def __getitem__(self, idx):
@@ -203,6 +239,11 @@ class RoboMMEDataset(Dataset):
             data["grounded_subgoal"] = data["grounded_subgoal_online"]
         data.pop("simple_subgoal_online")
         data.pop("grounded_subgoal_online")
+
+        if self.history_config is not None and history_flag(
+            self.history_config, "memory_gate"
+        ):
+            data["needs_memory"] = self._compute_needs_memory(idx, data)
         
         if self.history_config is not None and self.history_config.representation_type in ("symbolic", "hybrid"):
             data["grounded_subgoal"] = self.add_grounding_augmentation(data["grounded_subgoal"], noise_range=8)
@@ -268,6 +309,7 @@ class RoboMMEDataset(Dataset):
             
             "simple_subgoal",
             "grounded_subgoal",
+            "needs_memory",
             "prompt"
         ]:
             if key not in data:

@@ -61,3 +61,14 @@ recurrent_memory:
 symbolic_memory:
   budget: ${budget}
   type: simple_subgoal # [simple_subgoal, grounded_subgoal]
+
+temporal_encoder:
+  enabled: false
+  num_layers: 2
+  num_heads: 4
+  mlp_ratio: 4
+
+memory_gate:
+  enabled: false
+  lambda_route: 0.05
+  window_steps: 8

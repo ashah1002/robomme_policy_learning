@@ -357,6 +357,7 @@ class RoboMMEDataConfig(DataConfigFactory):
                         # symbolic memory
                         "simple_subgoal": "simple_subgoal",
                         "grounded_subgoal": "grounded_subgoal",
+                        "needs_memory": "needs_memory",
                     }
                 )
             ]

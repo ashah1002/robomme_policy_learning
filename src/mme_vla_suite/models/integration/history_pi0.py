@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import einops
+import optax
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
@@ -23,7 +24,7 @@ from mme_vla_suite.models.integration.history_observation import (
     preprocess_observation,
 )
 from mme_vla_suite.models.integration import history_gemma as _gemma
-from mme_vla_suite.models.config.utils import get_history_config
+from mme_vla_suite.models.config.utils import get_history_config, history_flag
 
 
 logger = logging.getLogger("history-pi0")
@@ -171,8 +172,7 @@ class HistoryPi0Config(Pi0Config):
                         ),
                     )
                 elif self.history_config.representation_type == "perceptual":
-                    observation_spec = HistAugObservation.from_base_obs(
-                        base_obs_spec,
+                    perceptual_kwargs = dict(
                         static_image_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
@@ -201,6 +201,13 @@ class HistoryPi0Config(Pi0Config):
                             ],
                             jnp.float32,
                         ),
+                    )
+                    if history_flag(self.history_config, "memory_gate"):
+                        perceptual_kwargs["needs_memory"] = jax.ShapeDtypeStruct(
+                            [batch_size], jnp.float32
+                        )
+                    observation_spec = HistAugObservation.from_base_obs(
+                        base_obs_spec, **perceptual_kwargs
                     )
                 elif self.history_config.representation_type == "recurrent":
                     observation_spec = HistAugObservation.from_base_obs(
@@ -372,12 +379,14 @@ class HistoryPi0(BaseModel):
                     mem_mods=[False, False, False]
                 )
             else:
+                gate_memory = history_flag(self.history_config, "memory_gate")
                 llm = nnx_bridge.ToNNX(
                     _gemma.Module(
                         configs=[paligemma_config, action_expert_config],
                         embed_dtype=config.dtype,
                         adarms=config.pi05,
                         integration_type=self.integration_type,
+                        gate_memory=gate_memory,
                     )
                 )
                 llm.lazy_init(
@@ -385,6 +394,7 @@ class HistoryPi0(BaseModel):
                     method="init",
                     use_adarms=[False, True] if config.pi05 else [False, False],
                     mem_mods=[False, True] if self.integration_type == "modulation" else [False, False],
+                    gate_memory=gate_memory,
                 )
 
         else:
@@ -454,7 +464,10 @@ class HistoryPi0(BaseModel):
     def embed_memory(self, obs: HistAugObservation):
         if self.representation_type in ("perceptual", "hybrid"):
             tokens, _, stats = self.mem_encoder(
-                obs.static_image_emb, obs.static_pos_emb, obs.static_state_emb
+                obs.static_image_emb,
+                obs.static_pos_emb,
+                obs.static_state_emb,
+                obs.static_mask,
             )
             input_mask = obs.static_mask
             ar_mask = [False] * tokens.shape[1]
@@ -664,6 +677,7 @@ class HistoryPi0(BaseModel):
             attn_mask = make_attn_mask(input_mask, ar_mask)
             
         positions = jnp.cumsum(input_mask, axis=1) - 1
+        mem_stats = None
 
         if self.integration_type == "expert":
             (mem_out, prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -673,7 +687,8 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, None, adarms_cond],
             )
         elif self.integration_type == "modulation":
-            mem_seq, mem_mask, _, _, stats = self.embed_memory(observation)
+            mem_seq, mem_mask, _, _, mem_stats = self.embed_memory(observation)
+            mem_gate = mem_stats.get("mem_gate") if mem_stats else None
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
@@ -681,6 +696,7 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, adarms_cond],
                 mem_seq=[None, mem_seq],
                 mem_mask=[None, mem_mask],
+                mem_gate=mem_gate,
             )
         else:
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -691,10 +707,24 @@ class HistoryPi0(BaseModel):
             )
 
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-        
-        # import pdb; pdb.set_trace()
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), stats
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if (
+            self.use_history
+            and history_flag(self.history_config, "memory_gate")
+            and observation.needs_memory is not None
+            and mem_stats is not None
+            and (mem_gate := mem_stats.get("mem_gate")) is not None
+        ):
+            lambda_route = float(
+                getattr(self.history_config.memory_gate, "lambda_route", 0.05)
+            )
+            route_loss = optax.sigmoid_binary_cross_entropy(
+                mem_gate.squeeze(-1), observation.needs_memory
+            )
+            return action_loss + lambda_route * route_loss[:, None], mem_stats
+
+        return action_loss, mem_stats if self.integration_type == "modulation" else stats
 
     @override
     def sample_actions(
@@ -741,7 +771,8 @@ class HistoryPi0(BaseModel):
             _, kv_cache = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
-            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+            mem_seq, mem_mask, _, _, mem_stats = self.embed_memory(observation)
+            mem_gate = mem_stats.get("mem_gate") if mem_stats else None
             
         else:
             prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
@@ -803,6 +834,7 @@ class HistoryPi0(BaseModel):
                     adarms_cond=[None, adarms_cond],
                     mem_seq=[None, mem_seq],
                     mem_mask=[None, mem_mask],
+                    mem_gate=mem_gate,
                 )
             else:
                 (prefix_out, suffix_out), _ = self.PaliGemma.llm(

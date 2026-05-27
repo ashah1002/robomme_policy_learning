@@ -118,6 +118,7 @@ class HistoryBlock(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     integration_type: str | None = None
+    gate_memory: bool = False
 
     @nn.compact
     def __call__(
@@ -129,6 +130,7 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
+        mem_gate,
         deterministic=True,
     ):  # noqa: FBT002
 
@@ -176,6 +178,8 @@ class HistoryBlock(nn.Module):
                 # Add Memory Modulation before FFN
                 if i == len(xs) - 1 and self.integration_type == "modulation":
                     mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
+                    if self.gate_memory and mem_gate is not None:
+                        mem_mod_vec = mem_gate[:, None, :] * mem_mod_vec
                     x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
                 
                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
@@ -222,6 +226,7 @@ class Module(nn.Module):
     adarms: bool = False
     
     integration_type: str | None = None
+    gate_memory: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -235,7 +240,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             HistoryBlock,
             prevent_cse=False,
-            static_argnums=(7,),  # 0=xs, 5=decode
+            static_argnums=(8,),  # deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -250,13 +255,15 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=mem_gate, 7=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
             integration_type=self.integration_type,
+            gate_memory=self.gate_memory,
         )
         self.final_norms = [
             RMSNorm(name=_name("final_norm", i) if self.integration_type != "expert" else _name("final_norm", i-1)) for i in range(len(self.configs))
@@ -278,6 +285,7 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+        mem_gate: at.Float[at.Array, "b 1"] | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -293,6 +301,7 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
+            mem_gate,
             deterministic,
         )
 
@@ -305,9 +314,16 @@ class Module(nn.Module):
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
 
-    def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):
+    def init(
+        self,
+        use_adarms: Sequence[bool],
+        mem_mods: Sequence[bool],
+        *,
+        gate_memory: bool = False,
+    ):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        mem_gate = jnp.ones((1, 1)) if gate_memory else None
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
@@ -321,4 +337,5 @@ class Module(nn.Module):
                 for c, m in zip(self.configs, mem_mods, strict=True)
             ],
             mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
+            mem_gate=mem_gate,
         )
